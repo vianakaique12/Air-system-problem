@@ -37,8 +37,8 @@ LABELS = ['neg', 'pos']
 # 1. LOADING DATA
 # ============================================================
 
-previous_years_data = pd.read_csv('air_system_previous_years.csv')
-present_year_data   = pd.read_csv('air_system_present_year.csv')
+previous_years_data = pd.read_csv('air_system_previous_years.csv', skiprows=20, na_values='na')
+present_year_data   = pd.read_csv('air_system_present_year.csv',   skiprows=20, na_values='na')
 
 print(f'Data shape (previous): {previous_years_data.shape}')
 print(f'Data shape (current):  {present_year_data.shape}')
@@ -47,10 +47,6 @@ print(f'Data shape (current):  {present_year_data.shape}')
 # ============================================================
 # 2. DATA CLEANING
 # ============================================================
-
-# Replace string 'na' with NaN
-previous_years_data.replace('na', np.nan, inplace=True)
-present_year_data.replace('na', np.nan, inplace=True)
 
 # Impute missing values with median (single strategy, robust to outliers)
 imputer = SimpleImputer(strategy='median')
@@ -190,22 +186,26 @@ print(f'Total estimated cost:                          ${total_cost}')
 # 7. HYPERPARAMETER TUNING (GradientBoosting)
 # ============================================================
 
+# Reduced grid for practical runtime on large datasets (60k rows x 171 features)
 param_grid = {
-    'learning_rate': [0.1, 0.05, 0.01],
-    'n_estimators':  [50, 100, 200],
-    'max_depth':     [3, 5, 7],
+    'learning_rate': [0.1, 0.05],
+    'n_estimators':  [50, 100],
+    'max_depth':     [3, 5],
 }
 
 # Use f1 scoring (pos class) — more meaningful than accuracy for imbalanced data
 grid_search = GridSearchCV(
     estimator=GradientBoostingClassifier(random_state=42),
     param_grid=param_grid,
-    cv=5,
+    cv=3,
     scoring='f1_macro',
     verbose=1,
     n_jobs=-1,
 )
-grid_search.fit(X_train_scaled, y_train)
+
+# Sample 20% of training data to speed up GridSearch
+X_gs, _, y_gs, _ = train_test_split(X_train_scaled, y_train, train_size=0.2, random_state=42, stratify=y_train)
+grid_search.fit(X_gs, y_gs)
 
 print('\n--- GridSearch Results (GradientBoosting) ---')
 print('Best parameters:', grid_search.best_params_)

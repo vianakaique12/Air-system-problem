@@ -5,6 +5,9 @@
 # Machine Learning - Air System Problem
 # Goal: Predict air system failures in trucks to optimize
 #       preventive maintenance and reduce costs.
+#
+# Strategy: train on historical data, evaluate on current year
+#           to simulate real production deployment.
 # ============================================================
 
 import pandas as pd
@@ -14,9 +17,20 @@ import seaborn as sns
 
 from sklearn.model_selection import train_test_split, GridSearchCV
 from sklearn.preprocessing import StandardScaler
+from sklearn.impute import SimpleImputer
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 from sklearn.svm import SVC
-from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
+from sklearn.metrics import classification_report, confusion_matrix, accuracy_score, f1_score
+
+# ============================================================
+# CONSTANTS
+# ============================================================
+
+COST_CORRECTIVE        = 500   # $ per missed defect (False Negative)
+COST_FALSE_ALARM       = 10    # $ per unnecessary maintenance (False Positive)
+COST_TRUE_PREVENTIVE   = 25    # $ per correctly flagged defect (True Positive)
+
+LABELS = ['neg', 'pos']
 
 
 # ============================================================
@@ -24,10 +38,10 @@ from sklearn.metrics import classification_report, confusion_matrix, accuracy_sc
 # ============================================================
 
 previous_years_data = pd.read_csv('air_system_previous_years.csv')
-present_year_data = pd.read_csv('air_system_present_year.csv')
+present_year_data   = pd.read_csv('air_system_present_year.csv')
 
-print(f'Data shape before cleaning (previous): {previous_years_data.shape}')
-print(f'Data shape before cleaning (current):  {present_year_data.shape}')
+print(f'Data shape (previous): {previous_years_data.shape}')
+print(f'Data shape (current):  {present_year_data.shape}')
 
 
 # ============================================================
@@ -38,20 +52,19 @@ print(f'Data shape before cleaning (current):  {present_year_data.shape}')
 previous_years_data.replace('na', np.nan, inplace=True)
 present_year_data.replace('na', np.nan, inplace=True)
 
-# Fill missing values with column mean (numeric columns only)
-numeric_cols_prev = previous_years_data.select_dtypes(include=[np.number]).columns
+# Impute missing values with median (single strategy, robust to outliers)
+imputer = SimpleImputer(strategy='median')
+
+numeric_cols_prev    = previous_years_data.select_dtypes(include=[np.number]).columns
 numeric_cols_present = present_year_data.select_dtypes(include=[np.number]).columns
 
-previous_years_data[numeric_cols_prev] = previous_years_data[numeric_cols_prev].fillna(
-    previous_years_data[numeric_cols_prev].mean()
+previous_years_data[numeric_cols_prev] = imputer.fit_transform(
+    previous_years_data[numeric_cols_prev]
 )
-present_year_data[numeric_cols_present] = present_year_data[numeric_cols_present].fillna(
-    present_year_data[numeric_cols_present].mean()
+# Use the same imputer fitted on historical data to avoid leakage
+present_year_data[numeric_cols_present] = imputer.transform(
+    present_year_data[numeric_cols_present]
 )
-
-# Fallback: fill any remaining NaN with median
-previous_years_data.fillna(previous_years_data.median(numeric_only=True), inplace=True)
-present_year_data.fillna(present_year_data.median(numeric_only=True), inplace=True)
 
 print(f'\nRemaining NaN (previous): {previous_years_data.isna().sum().sum()}')
 print(f'Remaining NaN (current):  {present_year_data.isna().sum().sum()}')
@@ -61,60 +74,79 @@ print(f'Remaining NaN (current):  {present_year_data.isna().sum().sum()}')
 # 3. FEATURE / TARGET SPLIT AND SCALING
 # ============================================================
 
-X_prev = previous_years_data.drop(columns=['class'])
-y_prev = previous_years_data['class']
+X_prev    = previous_years_data.drop(columns=['class'])
+y_prev    = previous_years_data['class']
 
 X_present = present_year_data.drop(columns=['class'])
 y_present = present_year_data['class']
 
-X_train_prev, X_test_prev, y_train_prev, y_test_prev = train_test_split(
-    X_prev, y_prev, test_size=0.3, random_state=42
+# stratify ensures both splits keep the same class proportion (important for imbalanced data)
+X_train, X_test_prev, y_train, y_test_prev = train_test_split(
+    X_prev, y_prev, test_size=0.3, random_state=42, stratify=y_prev
 )
-X_train_present, X_test_present, y_train_present, y_test_present = train_test_split(
-    X_present, y_present, test_size=0.3, random_state=42
-)
+X_test_present, y_test_present = X_present, y_present
 
+# Fit scaler only on training data to avoid leakage into test/present sets
 scaler = StandardScaler()
-X_train_prev_scaled    = scaler.fit_transform(X_train_prev)
-X_test_prev_scaled     = scaler.transform(X_test_prev)
-X_train_present_scaled = scaler.transform(X_train_present)
-X_test_present_scaled  = scaler.transform(X_test_present)
+X_train_scaled        = scaler.fit_transform(X_train)
+X_test_prev_scaled    = scaler.transform(X_test_prev)
+X_test_present_scaled = scaler.transform(X_test_present)
 
 
 # ============================================================
 # 4. MODEL TRAINING AND EVALUATION
 # ============================================================
 
-def evaluate_model(name, model, X_train, y_train, X_test_prev, y_test_prev, X_test_present, y_test_present):
-    model.fit(X_train, y_train)
+def evaluate_model(name, model, X_train, y_train, test_sets):
+    """
+    Train model and evaluate on multiple test sets.
 
-    for label, X_test, y_test in [('previous', X_test_prev, y_test_prev),
-                                   ('current',  X_test_present, y_test_present)]:
+    Parameters
+    ----------
+    name      : display name for the model
+    model     : sklearn estimator
+    X_train   : training features (scaled)
+    y_train   : training labels
+    test_sets : list of (label, X_test, y_test) tuples
+
+    Returns
+    -------
+    model     : fitted model
+    results   : dict with accuracy and f1 per test set
+    """
+    model.fit(X_train, y_train)
+    results = {}
+
+    for label, X_test, y_test in test_sets:
         y_pred = model.predict(X_test)
         acc = accuracy_score(y_test, y_pred)
+        f1  = f1_score(y_test, y_pred, pos_label='pos')
+
         print(f'\n--- {name} | {label} data ---')
-        print(f'Accuracy: {acc:.2f}')
+        print(f'Accuracy: {acc:.2f}  |  F1 (pos): {f1:.2f}')
         print(classification_report(y_test, y_pred))
         print('Confusion Matrix:')
-        print(confusion_matrix(y_test, y_pred))
+        print(confusion_matrix(y_test, y_pred, labels=LABELS))
 
-    return model
+        results[label] = {'accuracy': acc, 'f1': f1}
+
+    return model, results
 
 
-rf_model  = evaluate_model('RandomForest',          RandomForestClassifier(random_state=42),
-                            X_train_prev_scaled, y_train_prev,
-                            X_test_prev_scaled, y_test_prev,
-                            X_test_present_scaled, y_test_present)
+test_sets = [
+    ('previous (hold-out)', X_test_prev_scaled,    y_test_prev),
+    ('current (present)',   X_test_present_scaled, y_test_present),
+]
 
-svc_model = evaluate_model('SVC',                   SVC(random_state=42),
-                            X_train_prev_scaled, y_train_prev,
-                            X_test_prev_scaled, y_test_prev,
-                            X_test_present_scaled, y_test_present)
+rf_model,  rf_results  = evaluate_model('RandomForest',     RandomForestClassifier(random_state=42),     X_train_scaled, y_train, test_sets)
+svc_model, svc_results = evaluate_model('SVC',              SVC(random_state=42),                        X_train_scaled, y_train, test_sets)
+gb_model,  gb_results  = evaluate_model('GradientBoosting', GradientBoostingClassifier(random_state=42), X_train_scaled, y_train, test_sets)
 
-gb_model  = evaluate_model('GradientBoosting',      GradientBoostingClassifier(random_state=42),
-                            X_train_prev_scaled, y_train_prev,
-                            X_test_prev_scaled, y_test_prev,
-                            X_test_present_scaled, y_test_present)
+# Summary table
+print('\n--- Model Comparison (current year) ---')
+for name, results in [('RandomForest', rf_results), ('SVC', svc_results), ('GradientBoosting', gb_results)]:
+    r = results['current (present)']
+    print(f'{name:<22} Accuracy: {r["accuracy"]:.2f}  F1 (pos): {r["f1"]:.2f}')
 
 
 # ============================================================
@@ -122,7 +154,7 @@ gb_model  = evaluate_model('GradientBoosting',      GradientBoostingClassifier(r
 # ============================================================
 
 y_pred_rf_present = rf_model.predict(X_test_present_scaled)
-cm = confusion_matrix(y_test_present, y_pred_rf_present, labels=['neg', 'pos'])
+cm = confusion_matrix(y_test_present, y_pred_rf_present, labels=LABELS)
 
 plt.figure(figsize=(8, 6))
 sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
@@ -139,19 +171,19 @@ plt.show()
 # 6. COST ANALYSIS
 # ============================================================
 
+# cm was built with labels=LABELS (['neg','pos']), so ravel() is always [tn, fp, fn, tp]
 tn, fp, fn, tp = cm.ravel()
 
-cost_corrective              = fn * 500   # missed defects -> corrective maintenance
-cost_preventive_no_defect    = fp * 10    # false alarms   -> unnecessary preventive maintenance
-cost_preventive_with_defect  = tp * 25    # true positives -> scheduled preventive maintenance
+cost_corrective_total     = fn * COST_CORRECTIVE
+cost_false_alarm_total    = fp * COST_FALSE_ALARM
+cost_true_preventive_total = tp * COST_TRUE_PREVENTIVE
+total_cost = cost_corrective_total + cost_false_alarm_total + cost_true_preventive_total
 
-total_cost = cost_corrective + cost_preventive_no_defect + cost_preventive_with_defect
-
-print('\n--- Cost Analysis ---')
-print(f'Corrective maintenance (FN x $500):          ${cost_corrective}')
-print(f'Preventive - no defect (FP x $10):           ${cost_preventive_no_defect}')
-print(f'Preventive - with defect (TP x $25):         ${cost_preventive_with_defect}')
-print(f'Total estimated cost:                        ${total_cost}')
+print('\n--- Cost Analysis (RandomForest / current data) ---')
+print(f'Corrective maintenance   (FN={fn} x ${COST_CORRECTIVE}):  ${cost_corrective_total}')
+print(f'Unnecessary preventive   (FP={fp} x ${COST_FALSE_ALARM}):   ${cost_false_alarm_total}')
+print(f'Correct preventive       (TP={tp} x ${COST_TRUE_PREVENTIVE}):   ${cost_true_preventive_total}')
+print(f'Total estimated cost:                          ${total_cost}')
 
 
 # ============================================================
@@ -164,16 +196,23 @@ param_grid = {
     'max_depth':     [3, 5, 7],
 }
 
+# Use f1 scoring (pos class) — more meaningful than accuracy for imbalanced data
 grid_search = GridSearchCV(
     estimator=GradientBoostingClassifier(random_state=42),
     param_grid=param_grid,
     cv=5,
-    scoring='accuracy',
+    scoring='f1_macro',
     verbose=1,
     n_jobs=-1,
 )
-grid_search.fit(X_train_prev_scaled, y_train_prev)
+grid_search.fit(X_train_scaled, y_train)
 
-print('\n--- GridSearch Results ---')
+print('\n--- GridSearch Results (GradientBoosting) ---')
 print('Best parameters:', grid_search.best_params_)
-print('Best CV accuracy: {:.2f}'.format(grid_search.best_score_))
+print('Best CV F1 (macro): {:.2f}'.format(grid_search.best_score_))
+
+# Evaluate tuned model on current data
+best_gb = grid_search.best_estimator_
+y_pred_best_gb = best_gb.predict(X_test_present_scaled)
+print('\nTuned GradientBoosting on current data:')
+print(classification_report(y_test_present, y_pred_best_gb))
